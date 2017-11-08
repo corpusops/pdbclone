@@ -155,7 +155,7 @@ setup(
     license = 'GNU GENERAL PUBLIC LICENSE Version 2',
     author = 'Xavier de Gaye',
     author_email = 'xdegaye at users dot sourceforge dot net',
-    url = 'http://code.google.com/p/pdb-clone/',
+    url = 'https://github.com/corpusops/pdbclone.git',
     classifiers = [
         'Development Status :: 5 - Production/Stable',
         'Environment :: Console',
