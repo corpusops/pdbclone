@@ -154,7 +154,7 @@ setup(
     platforms = 'all',
     license = 'GNU GENERAL PUBLIC LICENSE Version 2',
     author = 'Xavier de Gaye',
-    author_email = 'xdegaye at users dot sourceforge dot net',
+    author_email = 'xdegaye@users.sourceforge.net',
     url = 'https://github.com/corpusops/pdbclone.git',
     classifiers = [
         'Development Status :: 5 - Production/Stable',
