@@ -1,0 +1,229 @@
+#summary Remote debugging.
+<wiki:toc max_depth="2"/>
+
+= Features =
+== Remote debugging ==
+Remote debugging is useful when the process is not associated with a controlling terminal or when pdb cannot use the controlling terminal (a daemon, a gui or ncurses based application, an embedded interpreter), or when debugging simultaneously multiple threads.  To use remote debugging, insert the following line in the code at the point where remote debugging should start:
+{{{
+from pdb_clone import pdb; pdb.set_trace_remote()
+}}}
+And run the _pdb-attach_ script after the program has stopped.
+
+Command line history, command completion and completion on the help topic are available. On unix, the remote process can be interrupted with _Ctrl-C_ when pdb-attach has the right privilege to send a signal to the remote process. Use the new _detach_ pdb command , or type _Ctl-D_ at the pdb prompt, to close the connection, to release the remote process from pdb control and to have it continue its execution without tracing overhead.
+
+Note that _netcat_ or _telnet_ can also be used to connect to the pdb instance, but _pdb-attach_ provides more functionalities.
+
+== Attach to a running program ==
+Three different methods may be used to attach, at any time and multiple times, to the *main thread* of a Python process:
+  * by instrumenting the code
+  * by setting an environment variable or a Python command line option
+  * by using gdb
+
+The first two methods use the _pdbhandler_ module to install a signal handler that instantiates a pdb instance for remote debugging.
+
+*Limitations:*
+  * The _tracemalloc_ debug tool cannot be used simultaneously with the _pdbhandler_ module because tracemalloc calls the PyGILState API during the creation of the subinterpreter used to instantiate pdb.
+  * The pdb instance is not created when the program is stopped in a subinterpreter.
+
+=== Instrument the code ===
+Insert in the code at the top of the program main module:
+{{{
+from pdb_clone import pdbhandler; pdbhandler.register()
+}}}
+and use the following command to attach to the process:
+{{{
+pdb-attach --kill --pid PID
+}}}
+
+Not on Windows.
+
+=== Set an environment variable or command line option ===
+Patch Python with the pdbhandler patch included in the installation tarball and set the the `PYTHONPDBHANDLER` environment variable or start Python with the `-X pdbhandler` command line option. For example on unix with a bash shell:
+{{{
+PYTHONPDBHANDLER="" python foobar.py
+}}}
+You can now use the following command to attach to this process:
+{{{
+pdb-attach --kill --pid PID
+}}}
+
+Not on Windows.
+
+=== Use gdb ===
+Simply run the following command:
+{{{
+pdb-attach --pid PID
+}}}
+
+There are some requirements for this last feature:
+ * Python must not have been stripped of its debugging symbols.
+ * gdb with a version above 7.0 must be available.
+
+
+= Documentation =
+== pdb remote debugging ==
+The _remote debugging_ feature add the _set_trace_remote()_ function, the _detach_ and _thread_ pdb commands whose documentations follows.
+
+set_trace_remote(host=b'127.0.0.1', port=7935, frame=None)
+ * Enter the debugger at `frame` or at the caller of `set_trace_remote()` when `frame` is `None`, and start listening on a socket at the next line debug event. This is equivalent to the existing hard-coded pdb breakpoint `set_trace()` with standard debugging.
+ * With Python 3, `host` *must* be a bytes object.
+
+pdb detach command
+ * Release the process from pdb control. Detaching the process continues its execution.
+ * After the socket is closed and in the case where the program had been attached to using _pdb-attach --pid PID_, all the resources associated with the debugging session are released including the pdb module that has been used to instantiate Pdb, and all the modules imported by pdb.
+
+pdb thread command
+{{{
+th(read) [threadnumber]
+        Without argument, display a summary of all active threads.
+        The summary prints for each thread:
+           1. the thread number assigned by pdb
+           2. the thread name
+           3. the Python thread identifier
+           4. the current stack frame summary for that thread
+        An asterisk '*' to the left of the pdb thread number indicates the
+        current thread, a plus sign '+' indicates the thread being traced by
+        pdb.
+
+        With a pdb thread number as argument, make this thread the current
+        thread. The 'where', 'up' and 'down' commands apply now to the frame
+        stack of this thread. The current scope is now the frame currently
+        executed by this thread at the time the command is issued and the
+        'list', 'll', 'args', 'p', 'pp', 'source' and 'interact' commands are
+        run in the context of that frame. Note that this frame may bear no
+        relationship (for a non-deadlocked thread) to that thread’s current
+        activity by the time you are examining the frame.
+        This command does not stop the thread.
+}}}
+
+== The pdbhandler module ==
+The pdbhandler module manages a signal handler that instantiates a pdb instance for remote debugging of the *main thread*. The module provides the following functions:
+
+register(host='127.0.0.1', port=7935, signum=<Signals.SIGUSR1: 10>)
+ * Register a pdb handler for signal 'signum'. 
+ * The handler sets pdb to listen on the (host, port) internet address and to start a remote debugging session on accepting a socket connection.
+
+unregister()
+ * Unregister the pdb handler.
+ * Do nothing when no handler has been registered.
+
+get_handler()
+ * Return the handler as a named tuple.
+ * The named tuple attributes are 'host', 'port', 'signum'.  Return None when no handler has been registered.
+
+Not on Windows.
+
+== The pdbhandler patch ==
+Follow these steps to install the patch:
+  * apply the patch included in the installation tarball to the Python source code
+  * copy Modules/Setup.dist to Modules/Setup
+  * rebuild and reinstall Python
+  * then install pdb_clone in order to install the `pdb-attach` command
+
+The patch adds the pdbhandler module to Python, so the previous section on the pdbhandler module applies also here.
+
+To register the pdb handler signal and enable attaching at any time to the process, set the `PYTHONPDBHANDLER` environment variable or the `-X pdbhandler` Python command line option to `"host port signum"` where:
+  * `"host port"` is the socket listening address and should match the address used in the `pdb-attach` command
+  * `signum` is the signal number used for setting the pdb handler and should match the setting of the `--kill` option in the `pdb-attach` command
+
+pdbhandler uses the default values `"127.0.0.1 7935 Signals.SIGUSR1"` when the `PYTHONPDBHANDLER` environment variable or the `-X pdbhandler` Python command line option are set to the empty string,
+
+Not on Windows.
+
+
+== The pdb-attach script ==
+The _pdb-attach_ script is used to attach to a running Python process that has been stopped by a pdb instance listening on a socket for an incoming connection, after a call to _set_trace_remote()_, or after gdb has injected a pending call, or after _pdbhandler_ has registered a signal handler.
+
+{{{
+pdb-attach:
+  usage: pdb-attach [-h] [-v] [-p PID] [-g [GDB]] [-k [SIGNUM]] [host] [port]
+
+  Attach to a remote Pdb instance. Command line history, command completion and
+  completion on the help topic are available. On unix, the remote process can be
+  interrupted with Ctrl-C when pdb-attach has the right privilege to send a
+  signal to the remote process. Use the 'detach' pdb command to release the
+  remote process from pdb control and have it continue its execution without
+  tracing overhead.
+
+  positional arguments:
+    host                  default: 127.0.0.1
+    port                  default: 7935
+
+  optional arguments:
+    -h, --help            show this help message and exit
+    -v, --verbose         print gdb/mi output
+    -p PID, --pid PID     attach to the Python process whose pid is PID; use gdb
+                          to inject the handling of a fake signal when the '--
+                          kill' optional argument is not used
+    -g [GDB], --gdb [GDB]
+                          use GDB to invoke gdb, the default is 'gdb'
+    -k [SIGNUM], --kill [SIGNUM]
+                          send the SIGNUM signal to process PID that has
+                          registered a handler for this signal with the
+                          pdbhandler.register() function and attach to the
+                          process; SIGNUM default value is 'Signals.SIGUSR1'
+
+  When the first argument is '-t' or '--test', spawn a process as Python started
+  with the remainder of the command line arguments and repeatedly attach
+  (followed by detach) to this process until the process exits.
+}}}
+
+== Limitations when using gdb ==
+ * On some linux distributions, attaching to a process with ptrace is now restricted to root by default. Attempting to run _pdb-attach --pid PID_ as a plain user will produce the following error message in that case:
+{{{
+ptrace: Operation not permitted
+}}}
+ This restriction may be disabled at the expense of security: see http://en.wikipedia.org/wiki/Ptrace and https://www.kernel.org/doc/Documentation/security/Yama.txt.
+
+ * Python must not have been stripped of its debugging symbols. Install the Python debugging extensions package, on Fedora this is the python-debuginfo or python3-debuginfo package, on Debian and Ubuntu the python2.7-dbg or python3.4-dbg package. Also, given how easy this is, one may build Python from source and it will include the debugging symbols by default.
+ * After the Python process is attached to while the _os.fork()_ statement is being processed, it may happen that both the parent and child process attempt simultenaously to bind to the same port in order to listen to the debugging socket. In this case, one process will fail to bind, print an error message on stderr and continue its execution after removing the trace function. The Python 3 subprocess module does not suffer from this problem as it uses a _fork_exec()_ C function.
+
+
+= Design =
+The _remote debugging_ implementation uses the existing redirection infrastructure in pdb.
+
+The _attach_ implementation with gdb uses the gdb Python extension support (see _[https://sourceware.org/gdb/current/onlinedocs/gdb/Python.html#Python Extending gdb using python]_) to add the _py-pdb_ gdb command. The _py-pdb_ command injects a call to _!Py_AddPendingCall()_ to the process being attached to by gdb, posting a fake signal to the Python interpreter, signal whose handler is a function of the _pdbhandler_ module named `_pdbhandler()`.
+
+The `_pdbhandler()` function instantiates a Pdb instance in a subinterpreter. The subinterpreter remains alive until the remote debugging socket is closed.
+
+Using a subinterpreter allows controling the resources allocated for the debugging session and is robust, allowing to attach mostly anywhere, for example:
+ * inside a loop iterating over sys.modules
+ * in the import machinery
+ * while importing a module imported by pdb (circular import)
+ * when the builtins module is shadowed by a dummy dictionary (see test_dynamic in the Python test suite)
+ * when sys.modules is empty (see sys_modules_context() in test_namespace_pkgs of the test suite)
+
+The Pdb instance needs to implement redirection of the standard streams to the socket, and use both sys modules for this purpose:
+ * the main interpreter sys module for the redirection of the Python statements executed at the pdb prompt or at the _interact_ pdb command
+ * the pdb subinterpreter sys module for the redirection of all the other pdb commands
+
+On Python 2.7 the restricted mode of the pdb subinterpreter is circumvented.
+
+
+= Testing with the Python test suite =
+The --test option of pdb-attach is used for testing the attach feature on any Python program by repeatedly attaching to the process.
+
+When testing with the Python test suite, some tests must be excluded on Python 3:
+ * tests that remove the trace function and use the no_tracing decorator or the refcount_test decorator:
+   no_tracing="test_exceptions test_io test_richcmp test_runpy test_gc test_sys test_threading"
+ * tests that raise an exception in a signal handler and therefore remove the trace function (see Python issue 20601):
+   no_tracing_2="test_multiprocessing_fork test_multiprocessing_forkserver test_multiprocessing_main_handling test_multiprocessing_spawn test_signal test_socket test_threadsignals"
+ * tests that patch open, sys.stdout or the io module:
+   mock="test_argparse test_code_module test_getpass"
+ * tests that exercise the maximum recursion limit:
+   recursion="test_io"
+ * tests that use the `PyGILState` API:
+   pygilstate="test_tracemalloc"
+
+So, to run the Python test suite on unix after applying the pdbhandler patch to Python and installing pdb_clone, one could run:
+
+{{{
+excluded="$no_tracing $no_tracing_2 $mock $recursion $pygilstate"
+pdb-attach --test -m test --randomize --exclude $excluded
+}}}
+
+Note that with this option, pdb-attach falls back to using gdb when the pdbhandler patch has not been applied to Python.
+
+<wiki:comment>
+vim:tw=0:sts=4:sw=4:wrap
+</wiki:comment>

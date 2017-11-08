@@ -1,0 +1,9 @@
+include NEWS
+include README
+include README.rst
+include LICENSE
+include MANIFEST.in
+include lib/__init__.py
+include python_patches/pdbhandler-py3.4.patch
+recursive-include pdb-clone.wiki *.wiki
+recursive-include lib/pdb_clone *.c

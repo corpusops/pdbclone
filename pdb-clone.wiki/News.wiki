@@ -1,0 +1,216 @@
+#summary NEWS
+#labels Featured
+
+=== pdb-clone 1.10 ===
+
+_Release date: 25-Feb-2015_
+
+ * _Port the default branch to python 2.7_:
+    pdb-clone runs now on Python 2.7 or Python 3.2 or newer and the same source code is used for all those Python versions.
+
+=== pdb-clone 1.9.2 ===
+
+_Release date: 15-Feb-2015_
+
+ * _Support Python 3.2._
+
+=== pdb-clone 1.9.1 ===
+
+_Release date: 13-Jan-2015_
+
+ * _Local installation is done using the user scheme instead of the home scheme._
+
+=== pdb-clone 1.9 ===
+
+_Release date: 15-Oct-2014_
+
+ * _Add the *pdbhandler* module and the `pdb-attach` option `--kill`_:
+    The pdbhandler module manages a signal handler that instantiates a pdb instance for remote debugging of the *main thread*, allowing to attach at any time to a running process.
+   Implemented in the py3 and py2.7 versions of pdb-clone.
+
+ * _A Python 3.4 patch that adds the *pdbhandler* module_:
+    The pdbhandler module can be enabled in a patched python by setting the `PYTHONPDBHANDLER` environment variable or by using the python `-X pdbhandler` command line option.
+
+ * _pdb-clone issue #12_:
+   Fix the problem that pdb modifies sys.stderr.
+
+ * _Fix the conflict with the tracemalloc debug tool_
+   Abort when pdb is instantiated by the pdbhandler module and the tracemalloc debug tool is tracing.
+
+=== pdb-clone 1.8 ===
+
+_Release date: 4-Aug-2014_
+
+ * _pdb-clone issue #11_:
+   Fix the `host port` positional arguments when pdb-attach is started with `--pid`.
+
+ * _pdb-clone issue #10_:
+   Fix the issue that the host, port keyword arguments of set_trace_remote() cannot be set.
+
+ * _Avoid a deadlock while stopped in !Py_MakePendingCalls or in !Py_AddPendingCall_:
+   See also python issue 11768: pthread_mutex_lock() is not reentrant.
+
+ * _Add the *thread* command_:
+   Implemented in the py3 and py2.7 versions of pdb-clone.
+
+=== pdb-clone 1.7 ===
+
+_Release date: 25-May-2014_
+
+ * _Python issue #20766_:
+   Fix reference leaks when setting the SIGINT handler.
+
+ * _Python issue #20269_:
+   The SIGINT handler is now set after step, next, until, return, continue.
+
+ * _Python issue #20703_:
+   Fix !RuntimeError caused by lazy imports in pdb.
+
+ * _Python issue #20853_:
+   Fix pdb `args` crashes when an arg is not printable.
+
+ * _Python issue #21161_:
+   Fix !NameError on frame local variables referenced by a generator expression run at the pdb prompt.
+
+=== pdb-clone 1.6 ===
+
+_Release date: 19-May-2014_
+
+ * _Python issue #20061_:
+   Make pdb through separate terminal more convenient.
+
+ * _Add the *remote debugging* and *attach* features_:
+   Implemented in the py3 and py2.7 versions of pdb-clone.
+
+=== pdb-clone 1.5 ===
+
+_Release date: 28-Dec-2013_
+
+ * _Python issue #16596_:
+   Skip stack unwinding when the `next`,  `until` and `return` commands are executed in generator context in Python 3.
+   This feature is not supported on Python 3 releases older than 3.4, in a generator invoked with the `̀for` or `yield from` statement.
+
+ * _Python issue #18714_:
+   Add tests for pdb.find_function.
+
+ * _Python issue #17154_:
+   Fix the issue that the `ignore` command raises `IndexError`.
+
+ * _Python issue #18764_:
+   Fix the issue that the `print` command prints `repr` instead of `str` in Python 3.
+
+=== pdb-clone 1.4 ===
+
+_Release date: 8-Feb-2013_
+
+ * _Python issue #17154_:
+   Fix the issue that the `ignore` command, without parameters, raises `IndexError`.
+
+ * Raising `SystemExit` from the prompt aborts the program being executed.
+
+ * Improve performances using a profiler function in cooperation with the trace function.
+
+=== pdb-clone 1.3 ===
+
+_Release date: 1-Feb-2013_
+
+ * _pdb-clone issue #7_:
+   Fix the issue that pdb does not stop at breakpoints on Windows after incorrect file name (lower cased) comparison.
+
+ * _pdb-clone issue #6_:
+   Stop now at breakpoint set in function after all breakpoints in the function have been cleared.
+
+ * _Python issue #17026_:
+   Fix the issue that pdb frames are accessible after the termination occurs on an uncaught exception.
+
+ * Implement front-end hooks to the `clear`, `enable` and `disable` commands.
+
+ * _pdb-clone issue #5_:
+   The trace function is removed after a `continue` command, when there are no breakpoints.
+
+ * _pdb-clone issue #4_:
+   A breakpoint may be set now on a function using its qualified name, rebound with an `import as` statement.
+
+ * _pdb-clone issue #3_:
+   Fix the issue that pdb does not stop after a `next` command, issued when returning from a function.
+
+ * _pdb-clone issue #2_:
+   Stops now at a breakpoint set in one of the callers after an interrupt, also when the caller code filename is a relative path name.
+
+=== pdb-clone 1.2 ===
+
+_Release date: 1-Jan-2013_
+
+ * Implementation of the `_bdb` extension module. With breakpoints, pdb-clone runs now at about 2 times the speed of the interpreter while pdb runs at 10 to 100 times the speed of the interpreter.
+
+ * _pdb-clone issue #1_:
+   A breakpoint can now be set at a function in a module after the module has been imported by the user.
+
+ * _Python issue #13120_:
+   Allow to call pdb.set_trace() from thread (retrofit from python repository).
+
+=== pdb-clone 1.1 ===
+
+_Release date: 4-Dec-2012_
+
+ * The new _py2.4_ version of pdb-clone runs on all python versions from 2.4 to 2.7 included. In this version, the _restart_ command only handles source code changes made to the main module.
+
+=== pdb-clone 1.0 ===
+
+_Release date: 23-Nov-2012_
+
+ * _Python issue #9633_:
+   Changes to the local variables of the top level frame are now not lost after issuing the _up_ and _down_ commands. Local variables of the lower (not top level) frames are now explicitly readonly.
+    * The pdb _getsourcelines()_ function gets now a new optional argument named _locals_.
+
+ * _Python issue #16482_:
+   Fix the issue that the line numbers of the printed traceback of an exception are incorrect when the exception occurs after a _continue_.
+
+ * _Python issue #14912_:
+   Fix the issue that pdb does not stop at a breakpoint after changes in the source code and a _restart_ command.
+    * The new _restart()_ method of Bdb must be called by its subclass prior to starting the debugger when handling source code changes.
+
+ * _Python issue #13044_:
+   Fix the issue that the python 2.7 version of pdb, when started with _set_trace()_, throws an ignored exception on termination.
+
+ * _Python issue #16180_:
+   Fix the issue that one must kill pdb to exit pdb, when there is a syntax error in the debuggee.
+
+ * _Python issue #16446_:
+   When the debugging session is started with _set_trace()_, the _quit_ command now ends the debugging session and the program continues its normal execution.
+
+ * _Python issues #14743 and #14788_:
+   Prevent now pdb from stepping into its own code on returning from the last frame or on handling a SIGINT signal.
+    * The _reset()_ method of Bdb has become private.
+
+ * _Python issue #14751_:
+   Fix the issue that pdb does not stop at a breakpoint set in one of the functions of the call stack because the corresponding frame does not have a local trace function.
+
+ * _Python issue #14728_:
+   Fix the issue that pdb does not stop after a _step_, _next_, _until_ or _return_ command because the corresponding frame does not have a local trace function.
+
+ * _Python issue #14913_:
+   A breakpoint may now be set on a comment line or on an empty line, the debugger will stop at the statement following this line.
+    * This fix also provides a significant improvement in performances as the local trace function is only set now on frames whose function has at least a breakpoint set on one of its lines, instead of being set on all the frames of a module, whenever a single breakpoint is set anywhere in the module where the frame is being executed.
+    * Pdb now does not stop on the execution of a function definition when a breakpoint is set on that function.
+    * The _user_line()_ new argument _breakpoint_hits_ is a tuple of the list of breakpoint numbers that have been hit at this line, and of the list of temporary breakpoint numbers that must be deleted.
+    * The Bdb methods _clear_all_file_breaks()_ and _get_break()_ have been removed.
+
+ * _Python issue #14789_:
+   Fix the issue that pdb stops in a function on a statement without breakpoints, when two breakpoints have been set on this same function.
+
+ * _Python issue #14808_:
+   Fix the issue that pdb does not stop at the first statement of a function when a breakpoint has been set on the function definition.
+
+ * _Python issue #14792_:
+   Fix the issue that pdb stops at the next statement where no breakpoint has been set, when a breakpoint is being set on a function and pdb is stopped in that same function.
+
+ * _Python issue #14795_:
+   A breakpoint may now be set on a function when the module where this function is defined has not been imported or has not been yet fully imported.
+
+ * _Python issue #6322_:
+   Pdb stops now at breakpoints that have been set on lines where the compiler does not generate bytecodes. For example on *global*, *else* and *finally* statement lines.
+
+<wiki:comment>
+vim:tw=0:sts=4:sw=4:wrap
+</wiki:comment>

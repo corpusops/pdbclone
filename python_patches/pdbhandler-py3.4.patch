@@ -1,0 +1,2045 @@
+diff --git a/Lib/bdb.py b/Lib/bdb.py
+--- a/Lib/bdb.py
++++ b/Lib/bdb.py
+@@ -3,6 +3,8 @@
+ import fnmatch
+ import sys
+ import os
++import linecache
++import reprlib
+ from inspect import CO_GENERATOR
+ 
+ __all__ = ["BdbQuit", "Bdb", "Breakpoint"]
+@@ -36,7 +38,6 @@
+         return canonic
+ 
+     def reset(self):
+-        import linecache
+         linecache.checkcache()
+         self.botframe = None
+         self._set_stopinfo(None, None)
+@@ -65,29 +66,29 @@
+         if self.stop_here(frame) or self.break_here(frame):
+             self.user_line(frame)
+             if self.quitting: raise BdbQuit
+-        return self.trace_dispatch
++        return self.trace_dispatch if sys.gettrace() else None
+ 
+     def dispatch_call(self, frame, arg):
+         # XXX 'arg' is no longer used
+         if self.botframe is None:
+             # First call of dispatch since reset()
+             self.botframe = frame.f_back # (CT) Note that this may also be None!
+-            return self.trace_dispatch
++            return self.trace_dispatch if sys.gettrace() else None
+         if not (self.stop_here(frame) or self.break_anywhere(frame)):
+             # No need to trace this function
+             return # None
+         # Ignore call events in generator except when stepping.
+         if self.stopframe and frame.f_code.co_flags & CO_GENERATOR:
+-            return self.trace_dispatch
++            return self.trace_dispatch if sys.gettrace() else None
+         self.user_call(frame, arg)
+         if self.quitting: raise BdbQuit
+-        return self.trace_dispatch
++        return self.trace_dispatch if sys.gettrace() else None
+ 
+     def dispatch_return(self, frame, arg):
+         if self.stop_here(frame) or frame == self.returnframe:
+             # Ignore return events in generator except when stepping.
+             if self.stopframe and frame.f_code.co_flags & CO_GENERATOR:
+-                return self.trace_dispatch
++                return self.trace_dispatch if sys.gettrace() else None
+             try:
+                 self.frame_returning = frame
+                 self.user_return(frame, arg)
+@@ -97,7 +98,7 @@
+             # The user issued a 'next' or 'until' command.
+             if self.stopframe is frame and self.stoplineno != -1:
+                 self._set_stopinfo(None, None)
+-        return self.trace_dispatch
++        return self.trace_dispatch if sys.gettrace() else None
+ 
+     def dispatch_exception(self, frame, arg):
+         if self.stop_here(frame):
+@@ -118,7 +119,7 @@
+             self.user_exception(frame, arg)
+             if self.quitting: raise BdbQuit
+ 
+-        return self.trace_dispatch
++        return self.trace_dispatch if sys.gettrace() else None
+ 
+     # Normally derived classes don't override the following
+     # methods, but they may if they want to redefine the
+@@ -257,7 +258,10 @@
+             # no breakpoints; run without debugger overhead
+             sys.settrace(None)
+             frame = sys._getframe().f_back
+-            while frame and frame is not self.botframe:
++            # This is also required by pdbhandler: to terminate the
++            # subinterpreter where lives the pdb instance, there must be no
++            # references to the pdb instance.
++            while frame:
+                 del frame.f_trace
+                 frame = frame.f_back
+ 
+@@ -277,7 +281,6 @@
+     def set_break(self, filename, lineno, temporary=False, cond=None,
+                   funcname=None):
+         filename = self.canonic(filename)
+-        import linecache # Import as late as possible
+         line = linecache.getline(filename, lineno)
+         if not line:
+             return 'Line %s:%d does not exist' % (filename, lineno)
+@@ -388,7 +391,6 @@
+         return stack, i
+ 
+     def format_stack_entry(self, frame_lineno, lprefix=': '):
+-        import linecache, reprlib
+         frame, lineno = frame_lineno
+         filename = self.canonic(frame.f_code.co_filename)
+         s = '%s(%r)' % (filename, lineno)
+@@ -647,7 +649,6 @@
+         if not name: name = '???'
+         print('+++ call', name, args)
+     def user_line(self, frame):
+-        import linecache
+         name = frame.f_code.co_name
+         if not name: name = '???'
+         fn = self.canonic(frame.f_code.co_filename)
+diff --git a/Lib/pdb.py b/Lib/pdb.py
+--- a/Lib/pdb.py
++++ b/Lib/pdb.py
+@@ -79,6 +79,12 @@
+ import inspect
+ import traceback
+ import linecache
++import socket
++import errno
++import pydoc
++import readline
++import shlex
++from operator import attrgetter
+ 
+ 
+ class Restart(Exception):
+@@ -86,7 +92,137 @@
+     pass
+ 
+ __all__ = ["run", "pm", "Pdb", "runeval", "runctx", "runcall", "set_trace",
+-           "post_mortem", "help"]
++           "set_trace_remote", "post_mortem", "help"]
++
++def restart_call(func, *args):
++    while 1:
++        try:
++            return func(*args)
++        except InterruptedError:
++            continue
++
++def user_method(user_event):
++    """Decorator of the Pdb user_* methods that controls the RemoteSocket."""
++    def wrapper(self, *args):
++        stdin = self.stdin
++        is_sock = isinstance(stdin, RemoteSocket)
++        try:
++            try:
++                if is_sock and not stdin.connect():
++                    return
++                return user_event(self, *args)
++            except Exception:
++                self.close()
++                raise
++        finally:
++            if is_sock and stdin.closed():
++                self.do_detach(None)
++    return wrapper
++
++class RemoteSocket:
++    """File like class that wraps the remote debugging socket."""
++
++    ST_INIT, ST_CONNECTED, ST_CLOSED = tuple(range(3))
++
++    def __init__(self, addr):
++        self.addr = addr
++        self.state = self.ST_INIT
++        self.server = None
++        self.socket = None
++        self.madefile = None
++
++    def connect(self):
++        if self.state is self.ST_INIT:
++            try:
++                self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++                self.server.setsockopt(
++                                    socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++                # The default socket timeout setting may have been changed by
++                # a call to socket.setdefaulttimeout().
++                self.server.setblocking(True)
++                self.server.bind(self.addr)
++                restart_call(self.server.listen, 0)
++                self.socket, _ = restart_call(self.server.accept)
++                self.socket.setblocking(True)
++                self.server.close()
++                self.server = None
++                # Do not use the preferred encoding as - a) both ends of the
++                # socket may not have the same preferred encoding - b) the
++                # debuggee may be playing tricks with the preferred encoding
++                # as in test_universal_newlines_communicate_encodings of
++                # test_subprocess.py.
++                self.madefile = self.socket.makefile('rw', encoding='utf-8')
++            except KeyboardInterrupt:
++                self.close()
++            except IOError as e:
++                self.close()
++                if e.errno == errno.EADDRINUSE:
++                    print('pdb.RemoteSocket:', str(e), file=sys.stderr)
++                else:
++                    raise
++            else:
++                self.state = self.ST_CONNECTED
++                init = ''
++                if hasattr(os, 'getpid'):
++                    init += 'PROCESS_PID:%s\n' % os.getpid()
++                try:
++                    procname = sys.argv[0]
++                except AttributeError:
++                    # sys.argv is not defined in a sub-interpreter.
++                    procname = '<unknown>'
++                init += 'PROCESS_NAME:%s\n' % procname
++                self.write(init)
++        return self.state is self.ST_CONNECTED
++
++    def readline(self):
++        if self.madefile:
++            try:
++                line = restart_call(self.madefile.readline)
++                if not line:
++                    self.close()
++                else:
++                    return line
++            except IOError:
++                self.close()
++                raise
++        return ''
++
++    def write(self, data):
++        if self.madefile:
++            try:
++                return restart_call(self.madefile.write, data)
++            except IOError:
++                self.close()
++                raise
++        return 0
++
++    def flush(self):
++        if self.madefile:
++            try:
++                self.madefile.flush()
++            except IOError:
++                self.close()
++                raise
++
++    def closed(self):
++        return self.state is not self.ST_CONNECTED
++
++    def close(self):
++        if self.state is self.ST_CONNECTED:
++            try:
++                self.write('%s socket closed by pdb.\n' % str(self.addr))
++            except IOError:
++                pass
++        self.state = self.ST_CLOSED
++        if self.madefile:
++            self.madefile.close()
++            self.madefile = None
++        if self.socket:
++            self.socket.close()
++            self.socket = None
++        if self.server:
++            self.server.close()
++            self.server = None
+ 
+ def find_function(funcname, filename):
+     cre = re.compile(r'def\s+%s\s*[(]' % re.escape(funcname))
+@@ -134,13 +270,18 @@
+ 
+ class Pdb(bdb.Bdb, cmd.Cmd):
+ 
++    _previous_sigint_handler = None
++
+     def __init__(self, completekey='tab', stdin=None, stdout=None, skip=None,
+-                 nosigint=False):
++                 nosigint=False, debug=False):
+         bdb.Bdb.__init__(self, skip=skip)
+         cmd.Cmd.__init__(self, completekey, stdin, stdout)
+         if stdout:
+             self.use_rawinput = 0
+         self.prompt = '(Pdb) '
++        self.pdb_thread = None
++        self.is_debug_instance = debug
++        self.closed = False
+         self.aliases = {}
+         self.displaying = {}
+         self.mainpyfile = ''
+@@ -148,7 +289,6 @@
+         self.tb_lineno = {}
+         # Try to load readline if it exists
+         try:
+-            import readline
+             # remove some common file name delimiters
+             readline.set_completer_delims(' \t\n`@#$%^&*()=+[{]}\\|;:\'",<>?')
+         except ImportError:
+@@ -181,14 +321,42 @@
+         self.commands_bnum = None # The breakpoint number for which we are
+                                   # defining a list
+ 
++    def __del__(self):
++        try:
++            self.close()
++        except Exception:
++            pass
++
++    def close(self):
++        if self.closed:
++            return
++        self.closed = True
++        if isinstance(self.stdin, RemoteSocket) and not self.is_debug_instance:
++            self.stdin.close()
++        if self._previous_sigint_handler:
++            signal.signal(signal.SIGINT, self._previous_sigint_handler)
++
+     def sigint_handler(self, signum, frame):
+         if self.allow_kbdint:
+             raise KeyboardInterrupt
+         self.message("\nProgram interrupted. (Use 'cont' to resume).")
+         self.set_step()
+         self.set_trace(frame)
+-        # restore previous signal handler
+-        signal.signal(signal.SIGINT, self._previous_sigint_handler)
++
++    def set_sigint_handler(self):
++        if not self.nosigint:
++            try:
++                Pdb._previous_sigint_handler = \
++                    signal.signal(signal.SIGINT, self.sigint_handler)
++            except ValueError:
++                # ValueError happens when do_continue() is invoked from
++                # a non-main thread in which case we just continue without
++                # SIGINT set. Would printing a message here (once) make
++                # sense?
++                if not sys.gettrace():
++                    self.message('The trace function has been removed and'
++                            ' this non-main thread cannot be interrupted.')
++                    self.close()
+ 
+     def reset(self):
+         bdb.Bdb.reset(self)
+@@ -200,6 +368,8 @@
+         self.curindex = 0
+         self.curframe = None
+         self.tb_lineno.clear()
++        self.current_thread = None
++        self.curframe_locals = None
+ 
+     def setup(self, f, tb):
+         self.forget()
+@@ -239,6 +409,7 @@
+ 
+     # Override Bdb methods
+ 
++    @user_method
+     def user_call(self, frame, argument_list):
+         """This method is called when there is the remote possibility
+         that we ever need to stop in this function."""
+@@ -248,6 +419,7 @@
+             self.message('--Call--')
+             self.interaction(frame, None)
+ 
++    @user_method
+     def user_line(self, frame):
+         """This function is called when we stop or break at this line."""
+         if self._wait_for_mainpyfile:
+@@ -282,6 +454,7 @@
+             return
+         return 1
+ 
++    @user_method
+     def user_return(self, frame, return_value):
+         """This function is called when a return trap is set here."""
+         if self._wait_for_mainpyfile:
+@@ -290,6 +463,7 @@
+         self.message('--Return--')
+         self.interaction(frame, None)
+ 
++    @user_method
+     def user_exception(self, frame, exc_info):
+         """This function is called if an exception occurs,
+         but only if we are to stop at or just below this level."""
+@@ -309,6 +483,12 @@
+             traceback.format_exception_only(exc_type, exc_value)[-1].strip()))
+         self.interaction(frame, exc_traceback)
+ 
++    # test_pyclbr fails when the method has been decorated.
++    user_call.__name__ = 'user_call'
++    user_line.__name__ = 'user_line'
++    user_return.__name__ = 'user_return'
++    user_exception.__name__ = 'user_exception'
++
+     # General interaction function
+     def _cmdloop(self):
+         while True:
+@@ -337,14 +517,21 @@
+                                  (expr, newvalue, oldvalue))
+ 
+     def interaction(self, frame, traceback):
++        # restore previous signal handler
++        if self._previous_sigint_handler:
++            signal.signal(signal.SIGINT, self._previous_sigint_handler)
+         if self.setup(frame, traceback):
+             # no interaction desired at this time (happens if .pdbrc contains
+             # a command like "continue")
+             self.forget()
+             return
+         self.print_stack_entry(self.stack[self.curindex])
+-        self._cmdloop()
+-        self.forget()
++        try:
++            self.pdb_toplevel_frame = frame
++            self._cmdloop()
++        finally:
++            self.pdb_toplevel_frame = None
++            self.forget()
+ 
+     def displayhook(self, obj):
+         """Custom displayhook for the exec in default(), which prevents
+@@ -354,24 +541,35 @@
+         if obj is not None:
+             self.message(repr(obj))
+ 
++    def redirect(self, func, *args, **kwds):
++        # When Pdb has been instantiated in a subinterpreter, the redirection
++        # must be done with the sys module of the main interpreter, not the
++        # one of the subinterpreter.
++        import sys as _sys
++
++        save_stdout = _sys.stdout
++        save_stderr = _sys.stderr
++        save_stdin = _sys.stdin
++        save_displayhook = _sys.displayhook
++        _sys.stdin = self.stdin
++        _sys.stdout = self.stdout
++        _sys.stderr = self.stdout
++        _sys.displayhook = self.displayhook
++        try:
++            func(*args, **kwds)
++        finally:
++            _sys.stdout = save_stdout
++            _sys.stderr = save_stderr
++            _sys.stdin = save_stdin
++            _sys.displayhook = save_displayhook
++
+     def default(self, line):
+         if line[:1] == '!': line = line[1:]
+         locals = self.curframe_locals
+         globals = self.curframe.f_globals
+         try:
+             code = compile(line + '\n', '<stdin>', 'single')
+-            save_stdout = sys.stdout
+-            save_stdin = sys.stdin
+-            save_displayhook = sys.displayhook
+-            try:
+-                sys.stdin = self.stdin
+-                sys.stdout = self.stdout
+-                sys.displayhook = self.displayhook
+-                exec(code, globals, locals)
+-            finally:
+-                sys.stdout = save_stdout
+-                sys.stdin = save_stdin
+-                sys.displayhook = save_displayhook
++            self.redirect(exec, code, globals, locals)
+         except:
+             exc_info = sys.exc_info()[:2]
+             self.error(traceback.format_exception_only(*exc_info)[-1].strip())
+@@ -984,6 +1182,7 @@
+         else:
+             lineno = None
+         self.set_until(self.curframe, lineno)
++        self.set_sigint_handler()
+         return 1
+     do_unt = do_until
+ 
+@@ -994,6 +1193,7 @@
+         function).
+         """
+         self.set_step()
++        self.set_sigint_handler()
+         return 1
+     do_s = do_step
+ 
+@@ -1003,6 +1203,7 @@
+         is reached or it returns.
+         """
+         self.set_next(self.curframe)
++        self.set_sigint_handler()
+         return 1
+     do_n = do_next
+ 
+@@ -1014,7 +1215,6 @@
+         are preserved.  "restart" is an alias for "run".
+         """
+         if arg:
+-            import shlex
+             argv0 = sys.argv[0:1]
+             sys.argv = shlex.split(arg)
+             sys.argv[:0] = argv0
+@@ -1028,6 +1228,7 @@
+         Continue execution until the current function returns.
+         """
+         self.set_return(self.curframe)
++        self.set_sigint_handler()
+         return 1
+     do_r = do_return
+ 
+@@ -1035,17 +1236,8 @@
+         """c(ont(inue))
+         Continue execution, only stop when a breakpoint is encountered.
+         """
+-        if not self.nosigint:
+-            try:
+-                self._previous_sigint_handler = \
+-                    signal.signal(signal.SIGINT, self.sigint_handler)
+-            except ValueError:
+-                # ValueError happens when do_continue() is invoked from
+-                # a non-main thread in which case we just continue without
+-                # SIGINT set. Would printing a message here (once) make
+-                # sense?
+-                pass
+         self.set_continue()
++        self.set_sigint_handler()
+         return 1
+     do_c = do_cont = do_continue
+ 
+@@ -1087,7 +1279,7 @@
+         sys.settrace(None)
+         globals = self.curframe.f_globals
+         locals = self.curframe_locals
+-        p = Pdb(self.completekey, self.stdin, self.stdout)
++        p = Pdb(self.completekey, self.stdin, self.stdout, debug=True)
+         p.prompt = "(%s) " % self.prompt.strip()
+         self.message("ENTERING RECURSIVE DEBUGGER")
+         sys.call_tracing(p.run, (arg, globals, locals))
+@@ -1097,10 +1289,22 @@
+ 
+     complete_debug = _complete_expression
+ 
++    def do_detach(self, arg):
++        """detach
++        Release the process from pdb control. Detaching the process continues
++        its execution.
++        """
++        self.clear_all_breaks()
++        self.set_continue()
++        self.close()
++        return 1
++
+     def do_quit(self, arg):
+         """q(uit)\nexit
+         Quit from the debugger. The program being executed is aborted.
+         """
++        if isinstance(self.stdin, RemoteSocket) and not self.is_debug_instance:
++            return self.do_detach(arg)
+         self._user_requested_quit = True
+         self.set_quit()
+         return 1
+@@ -1113,9 +1317,7 @@
+         Handles the receipt of EOF as a command.
+         """
+         self.message('')
+-        self._user_requested_quit = True
+-        self.set_quit()
+-        return 1
++        return self.do_quit(arg)
+ 
+     def do_args(self, arg):
+         """a(rgs)
+@@ -1367,9 +1569,24 @@
+         Start an interactive interpreter whose global namespace
+         contains all the (global and local) names found in the current scope.
+         """
++        def readfunc(prompt):
++            self.stdout.write(prompt)
++            self.stdout.flush()
++            line = self.stdin.readline()
++            line = line.rstrip('\r\n')
++            if line == 'EOF':
++                raise EOFError
++            return line
++
+         ns = self.curframe.f_globals.copy()
+         ns.update(self.curframe_locals)
+-        code.interact("*interactive*", local=ns)
++        if isinstance(self.stdin, RemoteSocket):
++            # Main interpreter redirection of the code module.
++            import sys as _sys
++            code.sys = _sys
++            self.redirect(code.interact, local=ns, readfunc=readfunc)
++        else:
++            code.interact("*interactive*", local=ns)
+ 
+     def do_alias(self, arg):
+         """alias [name [command [parameter parameter ...] ]]
+@@ -1415,6 +1632,94 @@
+         if args[0] in self.aliases:
+             del self.aliases[args[0]]
+ 
++    def _do_thread(self, arg, current_frames, tlist):
++        if not arg:
++            self.message('   {:3} {:18} {:16} {}'.format(
++                    'Nb', 'Name', 'Identifier', 'Stack entry'))
++            for (nb, t) in enumerate(tlist, start=1):
++                prefix = '+' if t is self.pdb_thread else ' '
++                prefix += '*' if t is self.current_thread else ' '
++                if t is self.pdb_thread:
++                    frame = self.pdb_toplevel_frame
++                else:
++                    frame = current_frames.get(t.ident)
++                if frame:
++                    stack_entry = self.format_stack_entry(
++                            (frame, frame.f_lineno), line_prefix).split('\n')
++                    self.message('{} {:3d} {:18} {:16d} {}\n{:43}{}'.format(
++                        prefix, nb, t.name, t.ident, stack_entry[0],
++                        '', stack_entry[1]))
++                else:
++                    self.message('{} {:3d} {:18} {:16d} {}'.format(
++                        prefix, nb, t.name, t.ident, 'Thread not active.'))
++            return
++
++        t = frame = None
++        try:
++            idx = int(arg)
++            if idx > 0:
++                t = tlist[idx - 1]
++        except (ValueError, IndexError):
++            pass
++        if t is None:
++            self.error(
++                'Invalid thread number, must be in a range from 1 to {:d}.'
++                .format(len(tlist)))
++        elif t is self.pdb_thread:
++            frame = self.pdb_toplevel_frame
++        else:
++            try:
++                frame = current_frames[t.ident]
++            except IndexError:
++                self.error('Internal error, the thread "{}" is not active.'
++                .format(t.name))
++        if frame:
++            self.setup(frame, None)
++            self.current_thread = t
++            self.print_stack_entry(self.stack[self.curindex])
++
++    def do_thread(self, arg):
++        """th(read) [threadnumber]
++        Without argument, display a summary of all active threads.
++        The summary prints for each thread:
++           1. the thread number assigned by pdb
++           2. the thread name
++           3. the python thread identifier
++           4. the current stack frame summary for that thread
++        An asterisk '*' to the left of the pdb thread number indicates the
++        current thread, a plus sign '+' indicates the thread being traced by
++        pdb.
++
++        With a pdb thread number as argument, make this thread the current
++        thread. The 'where', 'up' and 'down' commands apply now to the frame
++        stack of this thread. The current scope is now the frame currently
++        executed by this thread at the time the command is issued and the
++        'list', 'll', 'args', 'p', 'pp', 'source' and 'interact' commands are
++        run in the context of that frame. Note that this frame may bear no
++        relationship (for a non-deadlocked thread) to that thread’s current
++        activity by the time you are examining the frame.
++        This command does not stop the thread.
++        """
++        # Import the threading module in the main interpreter to get an
++        # enumeration of the main interpreter threads.
++        try:
++            import threading
++        except ImportError:
++            import dummy_threading as threading
++
++        if not self.pdb_thread:
++            self.pdb_thread = threading.current_thread()
++        if not self.current_thread:
++            self.current_thread = self.pdb_thread
++        current_frames = sys._current_frames()
++        tlist = sorted(threading.enumerate(), key=attrgetter('name', 'ident'))
++        try:
++            self._do_thread(arg, current_frames, tlist)
++        finally:
++            # For some reason this local must be explicitly deleted in order
++            # to release the subinterpreter.
++            del current_frames
++
+     def complete_unalias(self, text, line, begidx, endidx):
+         return [a for a in self.aliases if a.startswith(text)]
+ 
+@@ -1487,7 +1792,7 @@
+         self.message((self.help_exec.__doc__ or '').strip())
+ 
+     def help_pdb(self):
+-        help()
++        help(self.stdout)
+ 
+     # other helper functions
+ 
+@@ -1550,7 +1855,7 @@
+         'enable', 'ignore', 'condition', 'commands', 'step', 'next', 'until',
+         'jump', 'return', 'retval', 'run', 'continue', 'list', 'longlist',
+         'args', 'p', 'pp', 'whatis', 'source', 'display', 'undisplay',
+-        'interact', 'alias', 'unalias', 'debug', 'quit',
++        'thread', 'interact', 'alias', 'unalias', 'debug', 'detach', 'quit',
+     ]
+ 
+     for _command in _help_order:
+@@ -1578,6 +1883,21 @@
+ def set_trace():
+     Pdb().set_trace(sys._getframe().f_back)
+ 
++def set_trace_remote(host=b'127.0.0.1', port=7935, frame=None):
++    # When the set_trace_remote() hard-coded breakpoint is set in a loop
++    # iterating over sys.modules, allowing 'host' to be an str instance could
++    # possibly raise a RuntimeError (dictionary changed size) after the bind()
++    # call on the socket causes the import of 'encodings.idna'.
++    if not isinstance(host, bytes):
++        raise ValueError("'host' must be a bytes object.")
++
++    rsock = RemoteSocket((host, port))
++    pdb = Pdb(stdin=rsock, stdout=rsock)
++    if not frame:
++        frame = sys._getframe().f_back
++    pdb.set_trace(frame)
++    return rsock
++
+ # Post-Mortem interface
+ 
+ def post_mortem(t=None):
+@@ -1606,9 +1926,17 @@
+     run(TESTCMD)
+ 
+ # print help
+-def help():
+-    import pydoc
+-    pydoc.pager(__doc__)
++def help(stdout=sys.stdout):
++    save_stdout = sys.stdout
++    try:
++        sys.stdout = stdout
++        pydoc.pager(__doc__)
++        # Ends the pager output on a newline to enable prompt detection when
++        # doing remote debugging.
++        if save_stdout != stdout:
++            print(file=stdout)
++    finally:
++        sys.stdout = save_stdout
+ 
+ _usage = """\
+ usage: pdb.py [-c command] ... pyfile [arg] ...
+diff --git a/Lib/pdbhandler.py b/Lib/pdbhandler.py
+new file mode 100644
+--- /dev/null
++++ b/Lib/pdbhandler.py
+@@ -0,0 +1,40 @@
++"""The pdbhandler module."""
++
++import sys
++if sys.platform.startswith('win'):
++    raise ImportError('The pdbhandler module is not supported on Windows.')
++
++import signal
++import _pdbhandler
++from collections import namedtuple
++
++DFLT_ADDRESS = ('127.0.0.1', 7935)
++Handler = namedtuple('Handler', 'host, port, signum')
++
++def register(host=DFLT_ADDRESS[0], port=DFLT_ADDRESS[1],
++             signum=signal.SIGUSR1):
++    """Register a pdb handler for signal 'signum'.
++
++    The handler sets pdb to listen on the ('host', 'port') internet address
++    and to start a remote debugging session on accepting a socket connection.
++    """
++    _pdbhandler._register(host, port, signum)
++
++def unregister():
++    """Unregister the pdb handler.
++
++    Do nothing when no handler has been registered.
++    """
++    _pdbhandler._unregister()
++
++def get_handler():
++    """Return the handler as a named tuple.
++
++    The named tuple attributes are 'host', 'port', 'signum'.
++    Return None when no handler has been registered.
++    """
++    host, port, signum = _pdbhandler._registered()
++    if signum:
++        return Handler(host if host else DFLT_ADDRESS[0].encode(),
++                       port if port else DFLT_ADDRESS[1], signum)
++
+diff --git a/Lib/test/test_pdb.py b/Lib/test/test_pdb.py
+--- a/Lib/test/test_pdb.py
++++ b/Lib/test/test_pdb.py
+@@ -3,10 +3,22 @@
+ import doctest
+ import pdb
+ import sys
++import io
++import time
+ import types
+ import unittest
+ import subprocess
+ import textwrap
++from test.support import strip_python_stderr
++try:
++    from pdb_clone import attach as pdb_attach
++except ImportError:
++    pdb_attach = None
++
++try:
++    import threading
++except ImportError:
++    threading = None
+ 
+ from test import support
+ # This little helper class is essential for testing pdb under doctest.
+@@ -907,6 +919,91 @@
+     (Pdb) continue
+     """
+ 
++def test_thread_command():
++    """Testing the thread command.
++
++    >>> class State():
++    ...     def __init__(self): self.running = True
++    ...     def stop(self): self.running = False
++    ...     def __bool__(self): return self.running
++
++    >>> def deadlock(lock1, lock2, state):
++    ...     cnt = 0
++    ...     while state:
++    ...         with lock1:
++    ...             while state:
++    ...                 if lock2.acquire(timeout=.020):
++    ...                     deadlocked = False
++    ...                     cnt += 1
++    ...                     lock2.release()
++    ...                     break
++    ...                 else:
++    ...                     deadlocked = True
++
++    >>> def test_function():
++    ...     locks = (threading.Lock(), threading.Lock())
++    ...     t1 = threading.Thread(name='Thread_1', target=deadlock,
++    ...                                 args=(locks[0], locks[1], State()))
++    ...     t1.start()
++    ...     state2 = State()
++    ...     t2 = threading.Thread(name='Thread_2', target=deadlock,
++    ...                                 args=(locks[1], locks[0], state2))
++    ...     t2.start()
++    ...
++    ...     import pdb; pdb.Pdb(nosigint=True).set_trace()
++    ...     t1.join(); t2.join()
++
++    >>> with PdbTestInput([  # doctest: +ELLIPSIS
++    ...                    'time.sleep(.100)',
++    ...                    'thread',
++    ...                    'thread 2',
++    ...                    'thread',
++    ...                    'state.stop()',
++    ...                    'time.sleep(.100)',
++    ...                    'thread 1',
++    ...                    'state2.stop()',
++    ...                    'time.sleep(.100)',
++    ...                    'thread',
++    ...                    'continue']):
++    ...     test_function()
++    > <doctest test.test_pdb.test_thread_command[2]>(12)test_function()
++    -> t1.join(); t2.join()
++    (Pdb) time.sleep(.100)
++    (Pdb) thread
++       Nb  Name               Identifier       Stack entry
++    +*   1 MainThread          ... <doctest test.test_pdb.test_thread_command[2]>(12)test_function()
++                                               -> t1.join(); t2.join()
++         2 Thread_1            ... <doctest test.test_pdb.test_thread_command[1]>(6)deadlock()
++                                               -> if lock2.acquire(timeout=.020):
++         3 Thread_2            ... <doctest test.test_pdb.test_thread_command[1]>(6)deadlock()
++                                               -> if lock2.acquire(timeout=.020):
++    (Pdb) thread 2
++    > <doctest test.test_pdb.test_thread_command[1]>(6)deadlock()
++    -> if lock2.acquire(timeout=.020):
++    (Pdb) thread
++       Nb  Name               Identifier       Stack entry
++    +    1 MainThread          ... <doctest test.test_pdb.test_thread_command[2]>(12)test_function()
++                                               -> t1.join(); t2.join()
++     *   2 Thread_1            ... <doctest test.test_pdb.test_thread_command[1]>(6)deadlock()
++                                               -> if lock2.acquire(timeout=.020):
++         3 Thread_2            ... <doctest test.test_pdb.test_thread_command[1]>(6)deadlock()
++                                               -> if lock2.acquire(timeout=.020):
++    (Pdb) state.stop()
++    (Pdb) time.sleep(.100)
++    (Pdb) thread 1
++    > <doctest test.test_pdb.test_thread_command[2]>(12)test_function()
++    -> t1.join(); t2.join()
++    (Pdb) state2.stop()
++    (Pdb) time.sleep(.100)
++    (Pdb) thread
++       Nb  Name               Identifier       Stack entry
++    +*   1 MainThread          ... <doctest test.test_pdb.test_thread_command[2]>(12)test_function()
++                                               -> t1.join(); t2.join()
++    (Pdb) continue
++    """
++
++if not threading:
++    def test_thread_command(): pass
+ 
+ class PdbTestCase(unittest.TestCase):
+ 
+@@ -1042,10 +1139,131 @@
+     def tearDown(self):
+         support.unlink(support.TESTFN)
+ 
++class RemoteDebugging(unittest.TestCase):
++    """Remote debugging support."""
++
++    def setUp(self):
++        self.address = ('127.0.0.1', 7935)
++
++    def proc_error(self, stderr):
++        stderr = strip_python_stderr(stderr)
++        if stderr or self.proc.returncode:
++            raise AssertionError("Process return code is %d, "
++                    "stderr follows:\n%s" %
++                    (self.proc.returncode, stderr.decode('ascii', 'ignore')))
++
++    def attach(self, commands, attach_stdout):
++        try:
++            pdb_attach.attach(self.address, io.StringIO('\n'.join(commands)),
++                              attach_stdout, verbose=False)
++        except (ConnectionRefusedError, SystemExit):
++            self.proc.terminate()
++            stdout, stderr = self.proc.communicate()
++            if not self.proc_error(stderr):
++                raise
++
++    def run_pdb_remotely(self, source, commands):
++        """Run 'source' in a spawned process."""
++        cmd_line = [sys.executable, '-c', source]
++        self.proc = subprocess.Popen(cmd_line, stdout=subprocess.PIPE,
++                                     stderr=subprocess.PIPE)
++        try:
++            attach_stdout = io.StringIO()
++            self.attach(commands, attach_stdout)
++            stdout, stderr = self.proc.communicate()
++        finally:
++            self.proc.stdout.close()
++            self.proc.stderr.close()
++        self.proc_error(stderr)
++        return attach_stdout.getvalue()
++
++@unittest.skipIf(pdb_attach is None, 'pdb_clone is required to attach')
++class RemoteDebuggingTestCase(RemoteDebugging):
++    """Remote debugging test cases."""
++
++    def test_command_redirection(self):
++        # Check the redirection of pdb commands.
++        stdout = self.run_pdb_remotely("""if 1:
++            import pdb
++            pdb.set_trace_remote()
++            """,
++            [
++                'help detach',
++                'detach',
++            ]
++        )
++        self.assertIn('Release the process from pdb control.', stdout)
++
++    def test_statement_output_redirection(self):
++        # Check the redirection of python statements at the pdb prompt.
++        stdout = self.run_pdb_remotely("""if 1:
++            import pdb
++            a = 1
++            pdb.set_trace_remote()
++            """,
++            [
++                'print("a + 2 = %d" % (a + 2))',
++                'detach',
++            ]
++        )
++        self.assertIn('a + 2 = 3', stdout)
++
++    def test_debug_command(self):
++        stdout = self.run_pdb_remotely("""if 1:
++            import pdb
++            def foo():
++                a = 'in foo'
++            pdb.set_trace_remote()
++            fin = 'fin'
++            """,
++            [
++                'debug foo()',
++                'step',
++                'step',
++                'step',
++                'print(a)',
++                'quit',
++                'step',
++                'print(fin)',
++                'detach',
++            ]
++        )
++        self.assertIn('in foo', stdout)
++        self.assertIn('fin', stdout)
++
++    def test_interact_command(self):
++        some_text = 'testing the interact command'
++        stdout = self.run_pdb_remotely("""if 1:
++            import pdb
++            text = '%s'
++            pdb.set_trace_remote()
++            """ % some_text,
++            [
++                'interact',
++                'text',
++                'quit()',
++            ]
++        )
++        self.assertIn(some_text, stdout)
++
++    def test_non_default_address(self):
++        # Check that one can use a non default inet address.
++        self.address = (b'localhost', 6825)
++        stdout = self.run_pdb_remotely("""if 1:
++            import pdb
++            pdb.set_trace_remote({})
++            """.format(str(self.address).strip('()')),
++            [
++                'detach',
++            ]
++        )
++        self.assertIn(str(self.address), stdout)
+ 
+ def load_tests(*args):
+     from test import test_pdb
+-    suites = [unittest.makeSuite(PdbTestCase), doctest.DocTestSuite(test_pdb)]
++    suites = [unittest.makeSuite(PdbTestCase),
++              unittest.makeSuite(RemoteDebuggingTestCase),
++              doctest.DocTestSuite(test_pdb)]
+     return unittest.TestSuite(suites)
+ 
+ 
+diff --git a/Lib/test/test_pdbhandler.py b/Lib/test/test_pdbhandler.py
+new file mode 100644
+--- /dev/null
++++ b/Lib/test/test_pdbhandler.py
+@@ -0,0 +1,364 @@
++import sys
++import os
++import io
++import signal
++import unittest
++import subprocess
++from test.script_helper import assert_python_ok, assert_python_failure
++from test.support import strip_python_stderr
++if not sys.platform.startswith('win'):
++    from pdbhandler import DFLT_ADDRESS
++try:
++    from pdb_clone import attach as pdb_attach
++except ImportError:
++    pdb_attach = None
++
++@unittest.skipIf(sys.platform.startswith("win"), 'not supported on Windows')
++class PdbHandlerTestCase(unittest.TestCase):
++    def spawn_python(self, func, option, env_var):
++        code = 'import pdbhandler; print(pdbhandler.get_handler())'
++        if option is not None:
++            return func('-E', '-X', option, '-c', code)
++        elif env_var is not None:
++            env = os.environ.copy()
++            env['PYTHONPDBHANDLER'] = env_var
++            return func('-c', code, **env)
++
++    def run_ok(self, option, env, out):
++        rv, stdout, stderr = self.spawn_python(assert_python_ok, option, env)
++        self.assertEqual(stdout.rstrip(), out.encode())
++
++    def run_failure(self, option, env, out):
++        rv, stdout, stderr = self.spawn_python(assert_python_failure,
++                                               option, env)
++        self.assertIn(out.encode(), stderr.rstrip())
++
++    def test_sys_xoptions(self):
++        # Test python -X pdbhandler
++        self.run_ok('pdbhandler', None,
++                      "Handler(host=b'127.0.0.1', port=7935, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python -X pdbhandler=""
++        self.run_ok('pdbhandler=', None,
++                      "Handler(host=b'127.0.0.1', port=7935, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python -X pdbhandler="localhost 6825"
++        self.run_ok('pdbhandler=localhost 6825', None,
++                      "Handler(host=b'localhost', port=6825, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python -X pdbhandler="localhost 6825 SIGUSR2"
++        self.run_ok('pdbhandler=localhost 6825 %d' % signal.SIGUSR2, None,
++                      "Handler(host=b'localhost', port=6825, signum=%d)" %
++                      signal.SIGUSR2)
++
++        # Test python -X pdbhandler="localhost"
++        self.run_ok('pdbhandler=localhost', None,
++                      "Handler(host=b'localhost', port=7935, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python -X pdbhandler="localhost foo"
++        self.run_failure('pdbhandler=localhost foo', None,
++                         "Fatal Python error: pdbhandler:"
++                         " invalid address specification")
++
++    def test_env_var(self):
++        # Test empty env var
++        self.run_ok(None, '',
++                      "Handler(host=b'127.0.0.1', port=7935, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python env var "localhost 6825"
++        self.run_ok(None, 'localhost 6825',
++                      "Handler(host=b'localhost', port=6825, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python env var "localhost 6825 SIGUSR2"
++        self.run_ok(None, 'localhost 6825 %d' % signal.SIGUSR2,
++                      "Handler(host=b'localhost', port=6825, signum=%d)" %
++                      signal.SIGUSR2)
++
++        # Test python env var "localhost"
++        self.run_ok(None, 'localhost',
++                      "Handler(host=b'localhost', port=7935, signum=%d)" %
++                      signal.SIGUSR1)
++
++        # Test python env var "localhost foo"
++        self.run_failure(None, 'localhost foo',
++                         "Fatal Python error: pdbhandler:"
++                         " invalid address specification")
++
++class RemoteDebugging(unittest.TestCase):
++    """Remote debugging support."""
++
++    def setUp(self):
++        self.address = DFLT_ADDRESS
++        self.signum = signal.SIGUSR1
++
++    def proc_error(self, stderr):
++        stderr = strip_python_stderr(stderr)
++        if stderr or self.proc.returncode:
++            raise AssertionError("Process return code is %d, "
++                    "stderr follows:\n%s" %
++                    (self.proc.returncode, stderr.decode('ascii', 'ignore')))
++
++    def attach(self, commands, attach_stdout):
++        # Wait for pdbhandler to be imported, the signal handler
++        # registered and the main loop started.
++        self.proc.stdout.readline()
++        os.kill(self.proc.pid, self.signum)
++        try:
++            pdb_attach.attach(self.address, io.StringIO('\n'.join(commands)),
++                              attach_stdout, verbose=False)
++        except (ConnectionRefusedError, SystemExit):
++            self.proc.terminate()
++            stdout, stderr = self.proc.communicate()
++            if not self.proc_error(stderr):
++                raise
++
++    def _run_pdb(self, args, commands, next_commands=None, env=None):
++        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
++                                     stderr=subprocess.PIPE, env=env)
++        try:
++            attach_stdout = io.StringIO()
++            self.attach(commands, attach_stdout)
++            if next_commands:
++                self.attach(next_commands, attach_stdout)
++            stdout, stderr = self.proc.communicate()
++        finally:
++            self.proc.stdout.close()
++            self.proc.stderr.close()
++        self.proc_error(stderr)
++        return attach_stdout.getvalue()
++
++    def run_pdb_remotely(self, source, commands, next_commands=None):
++        """Run 'source' in a spawned process."""
++        header = ("""if 1:
++            import pdbhandler
++            pdbhandler.register('%s', %d, %d)
++            started = False""" %
++                (self.address[0], self.address[1], self.signum))
++        cmd_line = (sys.executable, '-c', header + '\n' + source)
++        return self._run_pdb(cmd_line, commands, next_commands)
++
++    def run_pdb_xoptions(self, option, source, commands, next_commands=None):
++        """Run 'source' in a spawned process with xoptions."""
++        header = 'started = False\n'
++        cmd_line = (sys.executable, '-E', '-X', option, '-c', header + source)
++        return self._run_pdb(cmd_line, commands, next_commands)
++
++    def run_pdb_env_var(self, env_var, source, commands, next_commands=None):
++        """Run 'source' in a spawned process with env var."""
++        env = os.environ.copy()
++        env['PYTHONPDBHANDLER'] = env_var
++        header = 'started = False\n'
++        cmd_line = (sys.executable, '-c', header + source)
++        return self._run_pdb(cmd_line, commands, next_commands, env=env)
++
++@unittest.skipIf(sys.platform.startswith("win"), 'not supported on Windows')
++@unittest.skipIf(pdb_attach is None, 'pdb_clone is required to attach')
++class PdbHandlerAttachTestCase(RemoteDebugging):
++    """Remote debugging test cases."""
++    def test_register(self):
++        # Check pdbhandler.register.
++        stdout = self.run_pdb_remotely("""if 1:
++            import time
++            i = 1
++            while i:
++                if not started:
++                    print('started.', flush=True)
++                    started = True
++                time.sleep(.020)
++            """,
++            [
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn(str(DFLT_ADDRESS), stdout)
++
++    def test_register_xoptions(self):
++        # Check pdbhandler.register with xoptions.
++        stdout = self.run_pdb_xoptions('pdbhandler',
++            """if 1:
++                import time
++                i = 1
++                while i:
++                    if not started:
++                        print('started.', flush=True)
++                        started = True
++                    time.sleep(.020)
++            """,
++            [
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn(str(DFLT_ADDRESS), stdout)
++
++    def test_register_env_var(self):
++        # Check pdbhandler.register with env var.
++        stdout = self.run_pdb_env_var('',
++            """if 1:
++                import time
++                i = 1
++                while i:
++                    if not started:
++                        print('started.', flush=True)
++                        started = True
++                    time.sleep(.020)
++            """,
++            [
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn(str(DFLT_ADDRESS), stdout)
++
++    def test_attach_twice(self):
++        # Attach twice to the same process and check the release of the
++        # resources.
++        stdout = self.run_pdb_remotely("""if 1:
++            import time
++            i = 1
++            second_session = 0
++            while i:
++                if not started:
++                    print('started.', flush=True)
++                    started = True
++                i += 1
++                if second_session:
++                    second_session = 0
++                    print('Ready to be attached to.', flush=True)
++                time.sleep(.020)
++            """,
++            [
++                'second_session = 1',
++                'detach',
++            ],
++            [
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn(str(DFLT_ADDRESS), stdout)
++
++    def test_get_handler(self):
++        # Check pdbhandler.get_handler.
++        stdout = self.run_pdb_remotely("""if 1:
++            import time
++            i = 1
++            while i:
++                if not started:
++                    print('started.', flush=True)
++                    started = True
++                time.sleep(.020)
++            """,
++            [
++                'import pdbhandler',
++                'pdbhandler.get_handler()',
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn("Handler(host=b'127.0.0.1', port=7935, signum=%d)" %
++                      signal.SIGUSR1, stdout)
++
++    def test_unregister(self):
++        # Check pdbhandler.unregister.
++        stdout = self.run_pdb_remotely("""if 1:
++            import time
++            i = 1
++            while i:
++                if not started:
++                    print('started.', flush=True)
++                    started = True
++                time.sleep(.020)
++            """,
++            [
++                'import pdbhandler',
++                'pdbhandler.unregister()',
++                'print(pdbhandler.get_handler())',
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn('None', stdout)
++
++    def test_register_non_default(self):
++        # Check pdbhandler.register non default arguments.
++        self.signum = signal.SIGUSR2
++        self.address = ('localhost', 6825)
++        stdout = self.run_pdb_remotely("""if 1:
++            import time
++            i = 1
++            while i:
++                if not started:
++                    print('started.', flush=True)
++                    started = True
++                time.sleep(.020)
++            """,
++            [
++                'import pdbhandler',
++                'pdbhandler.get_handler()',
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn("Handler(host=b'localhost', port=6825, signum=%d)" %
++            signal.SIGUSR2, stdout)
++
++    def test_register_non_default_xoptions(self):
++        # Check pdbhandler.register non default arguments.
++        self.address = ('localhost', 6825)
++        self.signum = signal.SIGUSR2
++        stdout = self.run_pdb_xoptions(
++            'pdbhandler=localhost 6825 %d' % signal.SIGUSR2,
++            """if 1:
++                import time
++                i = 1
++                while i:
++                    if not started:
++                        print('started.', flush=True)
++                        started = True
++                    time.sleep(.020)
++            """,
++            [
++                'import pdbhandler',
++                'pdbhandler.get_handler()',
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn("Handler(host=b'localhost', port=6825, signum=%d)" %
++            signal.SIGUSR2, stdout)
++
++    def test_register_non_default_env_var(self):
++        # Check pdbhandler.register non default arguments.
++        self.address = ('localhost', 6825)
++        self.signum = signal.SIGUSR2
++        stdout = self.run_pdb_env_var(
++            'localhost 6825 %d' % signal.SIGUSR2,
++            """if 1:
++                import time
++                i = 1
++                while i:
++                    if not started:
++                        print('started.', flush=True)
++                        started = True
++                    time.sleep(.020)
++            """,
++            [
++                'import pdbhandler',
++                'pdbhandler.get_handler()',
++                'i = 0',
++                'detach',
++            ]
++        )
++        self.assertIn("Handler(host=b'localhost', port=6825, signum=%d)" %
++            signal.SIGUSR2, stdout)
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/Modules/Setup.dist b/Modules/Setup.dist
+--- a/Modules/Setup.dist
++++ b/Modules/Setup.dist
+@@ -136,6 +136,9 @@
+ # debug tool to trace memory blocks allocated by Python
+ _tracemalloc _tracemalloc.c hashtable.c
+ 
++# _pdbhandler module
++_pdbhandler _pdbhandler.c
++
+ # The rest of the modules listed in this file are all commented out by
+ # default.  Usually they can be detected and built as dynamically
+ # loaded modules by the new setup.py script added in Python 2.1.  If
+diff --git a/Modules/_pdbhandler.c b/Modules/_pdbhandler.c
+new file mode 100644
+--- /dev/null
++++ b/Modules/_pdbhandler.c
+@@ -0,0 +1,555 @@
++#include "Python.h"
++#include "frameobject.h"
++
++#ifndef MS_WINDOWS
++#include <signal.h>
++
++/* the following macros come from Python: Modules/signalmodule.c */
++#ifndef NSIG
++# if defined(_NSIG)
++#  define NSIG _NSIG            /* For BSD/SysV */
++# elif defined(_SIGMAX)
++#  define NSIG (_SIGMAX + 1)    /* For QNX */
++# elif defined(SIGMAX)
++#  define NSIG (SIGMAX + 1)     /* For djgpp */
++# else
++#  define NSIG 64               /* Use a reasonable default value */
++# endif
++#endif
++
++#ifdef HAVE_SIGACTION
++typedef struct sigaction _Py_sighandler_t;
++#else
++typedef PyOS_sighandler_t _Py_sighandler_t;
++#endif
++
++typedef struct {
++    int signum;
++    PyObject *address;
++    _Py_sighandler_t previous;
++} pdbhandler_signal_t;
++
++static pdbhandler_signal_t pdbhandler_signal;
++#endif
++
++/* A dummy object that ends the pdb's subinterpreter when deallocated. */
++typedef struct {
++    PyObject_HEAD
++    PyThreadState *substate;
++} pdbtracerctxobject;
++
++/* Only one instance of pdbtracerctxobject at any given time.
++ * Note that we do not own a reference to this object. The 'stdin' pdb
++ * attribute owns a reference to this object, 'stdin' being an instance of
++ * pdb.RemoteSocket. */
++static pdbtracerctxobject *current_pdbctx = NULL;
++
++/* Forward declarations. */
++static void pdbtracerctx_dealloc(pdbtracerctxobject *);
++
++static PyTypeObject pdbtracerctxtype = {
++    PyVarObject_HEAD_INIT(NULL, 0)
++    "pdbhandler.context",               /* tp_name        */
++    sizeof(pdbtracerctxobject),         /* tp_basicsize   */
++    0,                                  /* tp_itemsize    */
++    (destructor)pdbtracerctx_dealloc,   /* tp_dealloc     */
++    0,                                  /* tp_print       */
++    0,                                  /* tp_getattr     */
++    0,                                  /* tp_setattr     */
++    0,                                  /* tp_reserved    */
++    0,                                  /* tp_repr        */
++    0,                                  /* tp_as_number   */
++    0,                                  /* tp_as_sequence */
++    0,                                  /* tp_as_mapping  */
++    0,                                  /* tp_hash        */
++    0,                                  /* tp_call        */
++    0,                                  /* tp_str         */
++    0,                                  /* tp_getattro    */
++    0,                                  /* tp_setattro    */
++    0,                                  /* tp_as_buffer   */
++    Py_TPFLAGS_DEFAULT,                 /* tp_flags       */
++    "Pdb tracer context",               /* tp_doc         */
++};
++
++/* Set up pdb in a sub-interpreter to handle the cases where we are stopped in
++ * a loop iterating over sys.modules, or within the import system, or while
++ * sys.modules or builtins are empty (such as in some test cases), and to
++ * avoid circular imports. */
++static int
++bootstrappdb(void *args)
++{
++    PyThreadState *substate;
++    Py_tracefunc tracefunc;
++    PyObject *tracemalloc;
++    PyObject *traceobj;
++    PyObject *type, *value, *traceback;
++    PyThreadState *mainstate = PyThreadState_GET();
++    PyObject *pdb = NULL;
++    PyObject *rsock = NULL;
++    int rc = -1;
++
++    /* When bootstrappdb() is a signal handler, 'args' is the address field of
++     * a pdbhandler_signal_t structure.
++     * 'kwds', a copy of the 'args' dictionary, is passed as argument to
++     * set_trace_remote(). */
++    if (!PyDict_Check((PyObject *)args)) {
++        PyErr_SetString(PyExc_TypeError, "'args' must be a dict");
++        return -1;
++    }
++
++    if (!Py_IsInitialized())
++        return 0;
++
++#ifdef WITH_THREAD
++    /* Do not instantiate pdb when stopped in a subinterpreter. */
++    if (!PyGILState_Check())
++        return 0;
++#endif
++
++    /* The tracemalloc module calls the PyGILState_ API during the
++     * subinterpreter creation and instantiation of pdb. */
++    tracemalloc = PyImport_ImportModule("tracemalloc");
++    if (tracemalloc != NULL ) {
++        int istrue;
++        PyObject *rv = PyObject_CallMethod(tracemalloc, "is_tracing", NULL);
++        Py_DECREF(tracemalloc);
++        if (rv == NULL)
++            return -1;
++        istrue = (rv == Py_True) ? 1 : 0;
++        Py_DECREF(rv);
++        if (istrue)
++            Py_FatalError("cannot run pdbhandler while"
++                          " tracemalloc is tracing");
++    }
++    else
++        PyErr_Clear();
++
++    /* See python issue 21033. */
++    if (mainstate->tracing || current_pdbctx)
++        return 0;
++
++    pdbtracerctxtype.tp_new = PyType_GenericNew;
++    if (PyType_Ready(&pdbtracerctxtype) < 0)
++        return -1;
++
++    PyThreadState_Swap(NULL);
++    if ((substate=Py_NewInterpreter()) == NULL) {
++        PyThreadState_Swap(mainstate);
++        PyErr_SetString(PyExc_RuntimeError,
++                        "pdb subinterpreter creation failed");
++        return -1;
++    }
++
++    pdb = PyImport_ImportModule("pdb");
++    if (pdb != NULL ) {
++        PyObject *func = PyObject_GetAttrString(pdb, "set_trace_remote");
++        if (func != NULL) {
++            PyObject *kwds = PyDict_Copy((PyObject *)args);
++            if (kwds && PyDict_SetItemString(kwds, "frame",
++                                    (PyObject *)mainstate->frame) == 0) {
++                PyObject *empty_tuple = PyTuple_New(0);
++                rsock = PyObject_Call(func, empty_tuple, kwds);
++                Py_DECREF(empty_tuple);
++            }
++            Py_XDECREF(kwds);
++        }
++        Py_XDECREF(func);
++    }
++
++    tracefunc = substate->c_tracefunc;
++    traceobj = substate->c_traceobj;
++    Py_XINCREF(traceobj);
++    if (rsock == NULL)
++        goto err;
++    if (tracefunc == NULL) {
++        PyErr_SetString(PyExc_RuntimeError,
++                        "Internal error - trace function not set");
++        goto err;
++    }
++
++    /* The sub-interpreter remains alive until the pdb socket is closed. */
++    current_pdbctx = (pdbtracerctxobject *) pdbtracerctxtype.tp_alloc(
++                                                    &pdbtracerctxtype, 0);
++    if (current_pdbctx == NULL)
++        goto err;
++    if (PyObject_SetAttrString(rsock, "_pdbtracerctxobject",
++                                      (PyObject *)current_pdbctx) != 0)
++        goto err;
++    current_pdbctx->substate = substate;
++
++    /* Swap the trace function between both tread states. */
++    PyEval_SetTrace(NULL, NULL);
++    PyThreadState_Swap(mainstate);
++    PyEval_SetTrace(tracefunc, traceobj);
++    Py_DECREF(traceobj);
++    rc = 0;
++    goto fin;
++
++err:
++    Py_XDECREF(traceobj);
++    PyErr_Fetch(&type, &value, &traceback);
++    Py_EndInterpreter(substate);
++    PyThreadState_Swap(mainstate);
++    if (type)
++        PyErr_Restore(type, value, traceback);
++fin:
++    Py_XDECREF(pdb);
++    Py_XDECREF(rsock);
++    Py_XDECREF(current_pdbctx);
++    return rc;
++}
++
++static void
++pdbtracerctx_dealloc(pdbtracerctxobject *self)
++{
++    if (self->substate != NULL) {
++        PyThreadState *substate = PyThreadState_GET();
++        PyThreadState_Swap(self->substate);
++        Py_EndInterpreter(self->substate);
++        PyThreadState_Swap(substate);
++        self->substate = NULL;
++    }
++    Py_TYPE(self)->tp_free((PyObject*)self);
++    current_pdbctx = NULL;
++}
++
++/* Windows does not have signal processing. */
++#ifndef MS_WINDOWS
++static void
++_pdbhandler(int signum)
++{
++    pdbhandler_signal_t *psignal = &pdbhandler_signal;
++
++    if (psignal->signum != signum)
++        return;
++
++    /* Silently ignore a full queue condition or a lock race condition. */
++    Py_AddPendingCall(bootstrappdb, (void *)psignal->address);
++}
++
++static int
++check_signum(int *psignum)
++{
++    if (*psignum == 0)
++        *psignum = SIGUSR1;
++    if (*psignum < 0 || *psignum >= NSIG) {
++        PyErr_SetString(PyExc_ValueError, "signal number out of range");
++        return 0;
++    }
++    return 1;
++}
++
++static int atexit_register(void)
++{
++    PyObject *pdbhandler;
++    PyObject *unregister;
++    PyObject *atexit;
++    PyObject *rv;
++    int rc;
++    static int registered = 0;
++
++    if (registered)
++        return 0;
++    registered = 1;
++
++    pdbhandler = PyImport_ImportModule("pdbhandler");
++    if (pdbhandler == NULL)
++        return -1;
++    unregister = PyObject_GetAttrString(pdbhandler, "unregister");
++    Py_DECREF(pdbhandler);
++    if (unregister == NULL)
++        return -1;
++    atexit = PyImport_ImportModule("atexit");
++    if (atexit == NULL) {
++        Py_DECREF(unregister);
++        return -1;
++    }
++    rv = PyObject_CallMethod(atexit, "register", "O", unregister);
++    rc = (rv != NULL ? 0 : -1);
++
++    Py_DECREF(atexit);
++    Py_DECREF(unregister);
++    Py_XDECREF(rv);
++    return rc;
++}
++
++static void
++_unregister(pdbhandler_signal_t *psignal)
++{
++    if (psignal->signum == 0)
++        return;
++#ifdef HAVE_SIGACTION
++    (void)sigaction(psignal->signum, &psignal->previous, NULL);
++#else
++    (void)signal(psignal->signum, psignal->previous);
++#endif
++    psignal->signum = 0;
++    Py_CLEAR(psignal->address);
++}
++
++static int
++_register(pdbhandler_signal_t *psignal, PyObject *host, int port, int signum)
++{
++    PyObject *address;
++    PyObject *host_bytes = NULL;
++    PyObject *port_obj = NULL;
++    int rc = -1;
++
++    if (!check_signum(&signum))
++        return -1;
++
++    /* Build the address dict. */
++    if ((address=PyDict_New()) == NULL)
++        return -1;
++    if (host != NULL) {
++        host_bytes = PyUnicode_EncodeLocale(host, NULL);
++        if (host_bytes == NULL)
++            goto err;
++        if (PyDict_SetItemString(address, "host", host_bytes) != 0)
++            goto err;
++    }
++    if (port != 0) {
++        port_obj = PyLong_FromLong(port);
++        if (port_obj == NULL)
++            goto err;
++        if (PyDict_SetItemString(address, "port", port_obj) != 0)
++            goto err;
++    }
++
++    if (psignal->signum != 0 && psignal->signum != signum)
++        _unregister(psignal);
++
++    if (psignal->signum == 0) {
++        int err;
++        _Py_sighandler_t previous;
++
++#ifdef HAVE_SIGACTION
++        struct sigaction action;
++        action.sa_handler = _pdbhandler;
++        sigemptyset(&action.sa_mask);
++        action.sa_flags = SA_RESTART;
++        err = sigaction(signum, &action, &previous);
++#else
++        previous = signal(signum, _pdbhandler);
++        err = (previous == SIG_ERR);
++#endif
++        if (err) {
++            PyErr_SetFromErrno(PyExc_OSError);
++            goto err;
++        }
++        psignal->signum = signum;
++        psignal->previous = previous;
++    }
++
++    Py_XDECREF(psignal->address);
++    Py_INCREF(address);
++    psignal->address = address;
++    rc = atexit_register();
++
++err:
++    Py_DECREF(address);
++    Py_XDECREF(host_bytes);
++    Py_XDECREF(port_obj);
++    return rc;
++}
++
++static PyObject*
++_pdbhandler_register(PyObject *self, PyObject *args, PyObject *kwargs)
++{
++    static char *kwlist[] = {"host", "port", "signum", NULL};
++    int signum = 0;
++    PyObject *host = NULL;
++    int port = 0;
++
++    if (!PyArg_ParseTupleAndKeywords(args, kwargs,
++            "|O!ii:register", kwlist, &PyUnicode_Type, &host, &port, &signum))
++        return NULL;
++    if (_register(&pdbhandler_signal, host, port, signum) == -1)
++        return NULL;
++    Py_RETURN_NONE;
++}
++
++static PyObject*
++_pdbhandler_unregister(PyObject *self)
++{
++    _unregister(&pdbhandler_signal);
++    Py_RETURN_NONE;
++}
++
++static PyObject*
++_pdbhandler_registered(PyObject *self)
++{
++    PyObject *rv;
++    pdbhandler_signal_t *psignal = &pdbhandler_signal;
++    PyObject *host = NULL;
++    PyObject *port = NULL;
++    int port_0 = 0;
++
++    if (psignal->address) {
++        host = PyDict_GetItemString(psignal->address, "host");
++        port = PyDict_GetItemString(psignal->address, "port");
++    }
++    if (port == NULL) {
++        port_0 = 1;
++        port = PyLong_FromLong(0);
++    }
++    rv = Py_BuildValue("(OOi)", host == NULL ? Py_None: host, port,
++                       psignal->signum);
++    if (port_0)
++        Py_DECREF(port);
++    return rv;
++}
++
++static PyMethodDef _pdbhandler_methods[] = {
++    {"_register",
++     (PyCFunction)_pdbhandler_register, METH_VARARGS|METH_KEYWORDS, NULL},
++    {"_unregister", (PyCFunction)_pdbhandler_unregister, METH_NOARGS, NULL},
++    {"_registered", (PyCFunction)_pdbhandler_registered, METH_NOARGS, NULL},
++    {NULL, NULL, 0, NULL}        /* Sentinel */
++};
++#endif
++
++PyDoc_STRVAR(_pdbhandler_doc, "The _pdbhandler module.");
++
++static struct PyModuleDef _pdbhandler_def = {
++    PyModuleDef_HEAD_INIT,
++    "_pdbhandler",
++    _pdbhandler_doc,
++    -1,
++#ifndef MS_WINDOWS
++    _pdbhandler_methods,
++#else
++    NULL,
++#endif
++    NULL,
++    NULL,
++    NULL,
++    NULL
++};
++
++PyMODINIT_FUNC
++PyInit__pdbhandler(void)
++{
++    return PyModule_Create(&_pdbhandler_def);
++}
++
++#ifndef MS_WINDOWS
++static int
++parse_options(PyObject *address, PyObject **phost, int *pport)
++{
++    PyObject *addresslist;
++    PyObject *valuelong;
++    long signum = 0L;
++    PyObject *host = NULL;
++    long port = 0L;
++
++    if (address == Py_True)
++        return 0;
++
++    assert(PyUnicode_Check(address));
++    if (PyUnicode_GetLength(address) == 0)
++        return 0;
++
++    if ((addresslist=PyUnicode_Split(address, NULL, -1)) == NULL)
++        return -1;
++
++    if (Py_SIZE(addresslist) >= 1) {
++        host = PyList_GET_ITEM(addresslist, 0);
++        if (host == NULL)
++            goto err;
++        Py_INCREF(host);
++    }
++    if (Py_SIZE(addresslist) >= 2) {
++        valuelong = PyLong_FromUnicodeObject(
++                                    PyList_GET_ITEM(addresslist, 1), 10);
++        if (valuelong == NULL)
++            goto err;
++        port = PyLong_AsLong(valuelong);
++        Py_DECREF(valuelong);
++        if (port < 1)
++            goto err;
++    }
++    if (Py_SIZE(addresslist) >= 3) {
++        valuelong = PyLong_FromUnicodeObject(
++                                    PyList_GET_ITEM(addresslist, 2), 10);
++        if (valuelong == NULL)
++            goto err;
++        signum = PyLong_AsLong(valuelong);
++        Py_DECREF(valuelong);
++        if (signum < 1 || signum >= NSIG)
++            goto err;
++    }
++    Py_DECREF(addresslist);
++    if (host)
++        *phost = host;
++    if (port)
++        *pport = Py_SAFE_DOWNCAST(port, long, int);
++    return Py_SAFE_DOWNCAST(signum, long, int);
++
++err:
++    Py_DECREF(addresslist);
++    Py_XDECREF(host);
++    return -1;
++}
++
++static PyObject *
++sys_xoptions(void)
++{
++    PyObject *xoptions, *key, *address;
++
++    xoptions = PySys_GetXOptions();
++    if (xoptions == NULL)
++        return NULL;
++
++    key = PyUnicode_FromString("pdbhandler");
++    if (key == NULL)
++        return NULL;
++
++    address = PyDict_GetItemWithError(xoptions, key);
++    Py_DECREF(key);
++    if (address == NULL) {
++        if (PyErr_Occurred())
++            return NULL;
++        Py_RETURN_NONE;
++    }
++    return address;
++}
++
++int _PyPdbhandler_Init(void)
++{
++    char *option;
++    PyObject *address;
++    int signum;
++    int rc;
++    PyObject *host = NULL;
++    int port = 0;
++
++    if ((option=Py_GETENV("PYTHONPDBHANDLER")))
++        address = PyUnicode_DecodeLocale(option, NULL);
++    else
++        address = sys_xoptions();
++
++    if (address == NULL)
++        return -1;
++    else if (address == Py_None) {
++        /* pdbhandler is not used. */
++        Py_DECREF(address);
++        return 0;
++    }
++
++    signum = parse_options(address, &host, &port);
++    Py_DECREF(address);
++    if (signum < 0)
++        Py_FatalError("pdbhandler: invalid address specification");
++
++    /* The pdbhandler and _pdbhandler modules are imported by
++     * atexit_register(), as a side effect of calling _register() when
++     * PYTHONPDBHANDLER is set or when Python is called with
++     * '-X pdbhandler'. */
++    rc = _register(&pdbhandler_signal, host, port, signum);
++
++    Py_XDECREF(host);
++    return rc;
++}
++#endif
++
+diff --git a/Modules/main.c b/Modules/main.c
+--- a/Modules/main.c
++++ b/Modules/main.c
+@@ -101,6 +101,8 @@
+    to seed the hashes of str, bytes and datetime objects.  It can also be\n\
+    set to an integer in the range [0,4294967295] to get hash values with a\n\
+    predictable seed.\n\
++PYTHONPDBHANDLER: instantiates a Pdb instance in a subinterpreter on\n\
++   receiving a signal.\n\
+ ";
+ 
+ static int
+diff --git a/PC/config.c b/PC/config.c
+--- a/PC/config.c
++++ b/PC/config.c
+@@ -14,6 +14,9 @@
+ extern PyObject* PyInit_errno(void);
+ extern PyObject* PyInit_faulthandler(void);
+ extern PyObject* PyInit__tracemalloc(void);
++#ifndef MS_WINDOWS
++extern PyObject* PyInit__pdbhandler(void);
++#endif
+ extern PyObject* PyInit_gc(void);
+ extern PyObject* PyInit_math(void);
+ extern PyObject* PyInit__md5(void);
+@@ -87,6 +90,9 @@
+     {"cmath", PyInit_cmath},
+     {"errno", PyInit_errno},
+     {"faulthandler", PyInit_faulthandler},
++#ifndef MS_WINDOWS
++    {"_pdbhandler", PyInit__pdbhandler},
++#endif
+     {"gc", PyInit_gc},
+     {"math", PyInit_math},
+     {"nt", PyInit_nt}, /* Use the NT os functions, not posix */
+diff --git a/Python/pythonrun.c b/Python/pythonrun.c
+--- a/Python/pythonrun.c
++++ b/Python/pythonrun.c
+@@ -111,6 +111,9 @@
+ extern void _PyHash_Fini(void);
+ extern int _PyTraceMalloc_Init(void);
+ extern int _PyTraceMalloc_Fini(void);
++#ifndef MS_WINDOWS
++extern int _PyPdbhandler_Init(void);
++#endif
+ 
+ #ifdef WITH_THREAD
+ extern void _PyGILState_Init(PyInterpreterState *, PyThreadState *);
+@@ -464,6 +467,11 @@
+     if (_PyTraceMalloc_Init() < 0)
+         Py_FatalError("Py_Initialize: can't initialize tracemalloc");
+ 
++#ifndef MS_WINDOWS
++    if (_PyPdbhandler_Init())
++        Py_FatalError("Py_Initialize: can't initialize _pdbhandler");
++#endif
++
+     initmain(interp); /* Module __main__ */
+     if (initstdio() < 0)
+         Py_FatalError(

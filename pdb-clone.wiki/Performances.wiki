@@ -1,0 +1,152 @@
+#summary Performances comparison.
+<wiki:toc max_depth="1" />
+
+= Performances comparison =
+
+When used *without breakpoints* and with _set_trace_, pdb and pdb-clone run at the speed of the Python interpreter.
+
+The following table compares the speed of pdb and pdb-clone with the speed of the interpreter for some tests and some python versions when pdb and pdb-clone are used *with breakpoints*. The table shows that with breakpoints, pdb-clone runs about 1.5 times slower than the interpreter while pdb runs 10 to 100 times slower than the interpreter. A speed 1.5 times slower than the speed of the interpreter is not far from the best performance obtainable since when a trace function is set, an optimization named _computed goto_ is disabled in the main loop of the Python interpreter and this optimization brings a gain of 15-20% in the performances of the interpreter according to a comment in `Python/ceval.c`.
+
+The tests are described below.
+
+||                ||                        || *pystone*     || *pystone*       || *pystone*     || *simple test*   || *simple test* ||
+||                ||                        ||_no breakpoint_||_with breakpoint_||_tracing lines_||_with breakpoint_||_tracing lines_||
+||_Python 3.3_    ||                        ||               ||                 ||               ||                 ||               ||
+||                ||pdb-clone               ||1.3            ||1.4              ||1.9            ||1.2              ||2.6            ||
+||                ||pdb-clone without `_bdb`||6              ||7                ||14             || 4               ||52             ||
+||                ||pdb                     ||10             ||74               ||78             ||105              ||107            ||
+||_Python 2.7_    ||                        ||               ||                 ||               ||                 ||               ||
+||                ||pdb-clone               ||1.2            ||1.3              ||1.8            ||1.3              ||2.2            ||
+||                ||pdb                     ||10             ||79               ||86             ||85               ||85             ||
+
+The line _pdb-clone without `_bdb`_ shows the results obtained when the tests are run without the `_bdb` extension module.
+
+= Files =
+Two script files are used by the tests.
+
+== pystone_test.py ==
+{{{
+import test.pystone as pystone
+
+pystone.main(loops=50000)
+}}}
+
+== simple_test.py ==
+{{{
+import timeit
+
+def foo():
+    s = 0
+    r = []
+    for i in range(10):
+        s += i
+        r.append(s)
+    if not r:
+        # Statement never reached.
+        lno = 11
+    return r
+
+def main():
+    t = timeit.Timer('foo()', 'from __main__ import foo')
+    print(t.timeit())
+
+if __name__ == "__main__":
+    main()
+}}}
+
+= Test 1: pystone no breakpoint  =
+No breakpoint is set in the module under test, the breakpoint is set in another
+module instead (thus, the trace function is set).
+
+Commands:
+{{{
+    pdb pystone_test.py
+    pdb-clone pystone_test.py
+}}}
+
+Content of the .pdbrc:
+{{{
+import simple_test
+break simple_test.main
+continue
+quit
+}}}
+
+= Test 2: pystone with breakpoint  =
+A breakpoint is set in the module under test.
+
+Commands:
+{{{
+    pdb pystone_test.py
+    pdb-clone pystone_test.py
+}}}
+
+Content of the .pdbrc:
+{{{
+import test.pystone
+break test.pystone.main
+continue
+continue
+quit
+}}}
+
+= Test 3: pystone tracing lines  =
+A breakpoint is set in the module under test and the function where the
+breakpoint is set, is called.
+
+Commands:
+{{{
+    pdb pystone_test.py
+    pdb-clone pystone_test.py
+}}}
+
+Content of the .pdbrc:
+{{{
+import test.pystone
+break test.pystone.main
+break test.pystone.Proc0
+ignore 2 50000
+continue
+continue
+quit
+}}}
+
+= Test 4: simple test with breakpoint  =
+A breakpoint is set in the module under test.
+
+Commands:
+{{{
+    pdb simple_test.py
+    pdb-clone simple_test.py
+}}}
+
+Content of the .pdbrc:
+{{{
+break main
+continue
+continue
+quit
+}}}
+
+= Test 5: simple test tracing lines  =
+A breakpoint is set in the module under test and the function where the
+breakpoint is set, is called.
+
+Commands:
+{{{
+    pdb simple_test.py
+    pdb-clone simple_test.py
+}}}
+
+Content of the .pdbrc:
+{{{
+break main
+break 11
+continue
+continue
+quit
+}}}
+
+<wiki:comment>
+vim:tw=0:sts=4:sw=4:wrap
+</wiki:comment>

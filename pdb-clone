@@ -1,0 +1,7 @@
+#!/usr/bin/env python
+
+from pdb_clone import pdb, bdb, __version__
+mode = 'with' if bdb._bdb else 'without'
+print('pdb-clone {} ({} the _bdb extension module).'
+      .format(__version__, mode))
+pdb.main()

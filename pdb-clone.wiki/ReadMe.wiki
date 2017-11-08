@@ -1,0 +1,140 @@
+#summary README
+#labels Featured,Phase-Deploy
+<wiki:toc max_depth="1" />
+
+= pdb-clone =
+A clone of [http://docs.python.org/3/library/pdb.html pdb], fast and with the _remote debugging_ and _attach_ features.
+
+pdb-clone features:
+  * Implement the most recent Python 3 features of pdb, as defined in the Python 3 pdb [http://docs.python.org/3/library/pdb.html documentation]. The pdb command line interface remains unchanged except for the new `detach` and `thread` pdb commands.
+  * Improve significantly pdb performance. With breakpoints, pdb-clone runs just below the speed of the interpreter while pdb runs 10 to 100 times slower than the interpreter, see [Performances].
+  * Extend pdb with remote debugging. A remote debugging session may be started when the program stops at a `pdb.set_trace_remote()` hard-coded breakpoint, or at any time and multiple times by attaching to the process main thread. See RemoteDebugging.
+  * Fix pdb long standing bugs entered in the Python issue tracker, see the [News NEWS].
+  * Add a bdb comprehensive test suite (more than 70 tests) and run both pdb and bdb test suites.
+
+pdb-clone runs the same source code on all the supported versions of Python, which are:
+  * Python 3: from version 3.2 onward.
+  * Python 2: version 2.7.
+
+===== Usage =====
+Invoke pdb-clone as a script to debug other scripts. For example:
+<code language="sh">
+$ pdb-clone myscript.py</code>
+
+Or use one of the different ways of running pdb described in the
+[http://docs.python.org/library/pdb.html pdb documentation] and
+replace
+<code language="py">
+import pdb</code>
+
+with
+<code language="py">
+from pdb_clone import pdb</code>
+
+or with
+<code language="py">
+import pdb_clone.pdb as pdb</code>
+
+So, for example, to hard-code a breakpoint at a given point in a program:
+<code language="py">
+import pdb_clone.pdb as pdb; pdb.set_trace()</code>
+
+= Installation =
+=== Install with pip ===
+pdb-clone is at [https://pypi.python.org/pypi/pdb-clone PyPi].
+
+To install pdb-clone with pip:
+<code language="sh">
+$ sudo pip install pdb-clone</code>
+
+=== Installation from source ===
+Download the tarball from [https://pypi.python.org/pypi/pdb-clone PyPi].
+
+Untar the archive, change directory to the distribution directory and run the
+setup script to install pdb-clone:
+{{{
+$ tar xzf pdb-clone-d.d.tar.gz
+$ cd pdb-clone-d.d
+$ python setup.py install
+}}}
+
+The installation process builds the `_bdb` C extension module and requires some
+Python header files. You may need to install a python-dev package for the build
+to succeed. On debian systems this is done with:
+{{{
+$ aptitude install build-essential python-dev
+}}}
+You don't need to install anything when you have built and installed Python from
+source.
+
+When building of the `_bdb` extension module fails, the install process prints a warning and pdb-clone falls back on running a Python implementation of the `_bdb` extension module.
+In that case, the build of the `pdbhandler` extension module will also probably fail, and running `pdb-attach --pid PID` will fail with the following error message:
+{{{
+ImportError: No module named pdb_clone.pdbhandler
+}}}
+
+The first line printed by the _pdb-clone_ script states wether it is running
+with the `_bdb` extension module or not.
+
+=== Local installation ===
+Use a local installation when you do not have root privileges and those are
+required to install Python packages. Local installation is done using the
+_user scheme_:
+<code language="sh">
+$ pip install --user pdb-clone</code>
+
+or
+
+<code language="sh">
+$ python setup.py install --user</code>
+
+=== Build a source distribution ===
+First, the wiki repository must be cloned in pdb-clone root directory
+(_pdb-clone.wiki_ must be a subdirectory of the root directory).
+See [http://code.google.com/p/pdb-clone/source/checkout?repo=wiki cloning the wiki].
+
+For example, to build a source distribution:
+{{{
+$ python setup.py sdist
+}}}
+
+
+= Test suite =
+The test suite is run against the installed version of pdb_clone, not against the developpement version. To run all the tests, first install pdb_clone and then run the following command from the root directory:
+{{{
+$ python setup.py test
+}}}
+To get help on the available test options:
+{{{
+$ python setup.py test --help
+}}}
+For example, to obtain the verbose output of all the pdb tests whose name starts with _test_issue14_, while stopping at the occurence of the first test failure:
+{{{
+$ python setup.py test --tests=pdb --detail --prefix=test_issue14 --stop
+}}}
+
+
+= Support =
+Use the [http://code.google.com/p/pdb-clone/issues/list issue tracker] to report
+bugs or to request new features.
+
+When reporting bugs, please indicate pdb-clone version and wether it is running
+with `_bdb`.  The first line printed by the _pdb-clone_ script prints pdb-clone
+version and states wether it is running with the `_bdb` extension module or not.
+
+When running pdb-clone from the Python interpreter:
+  * `pdb_clone.__version__` is pdb-clone version.
+  * The value of `bdb.Bdb.__bases__` is `<class '_bdb.BdbTracer'>`, when pdb-clone runs with the `_bdb` extension module.
+
+
+= Licensing =
+This software is licensed under the terms you may find in the file named
+_LICENSE_ in this directory.
+
+Copyright © 2001-2012 Python Software Foundation; All Rights Reserved.<br>
+pdb-clone is a derivative work of a part of Python and as such, subject to the
+Python [http://docs.python.org/2.7/license.html license].
+
+<wiki:comment>
+vim:tw=0:sts=4:sw=4:wrap
+</wiki:comment>
