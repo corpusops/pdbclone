@@ -1755,7 +1755,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         executed by this thread at the time the command is issued and the
         'list', 'll', 'args', 'p', 'pp', 'source' and 'interact' commands are
         run in the context of that frame. Note that this frame may bear no
-        relationship (for a non-deadlocked thread) to that thread’s current
+        relationship (for a non-deadlocked thread) to that thread's current
         activity by the time you are examining the frame.
         This command does not stop the thread.
         """
