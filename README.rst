@@ -1,3 +1,10 @@
+    
+**Support development**
+- Ethereum: ``0xa287d95530ba6dcb6cd59ee7f571c7ebd532814e``
+- Bitcoin: ``3GH1S8j68gBceTeEG5r8EJovS3BdUBP2jR``
+- `paypal <https://paypal.me/kiorky>`_
+
+
 **Features**
 
   * Implement the most recent Python 3 features of pdb, as defined in the Python 3 `pdb documentation`_. The pdb command line interface remains unchanged except for the new ``detach`` and ``thread`` pdb commands.
