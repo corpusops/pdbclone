@@ -1,6 +1,4 @@
     
-**Support development of this fork, im not the author !!!**
-  * `paypal <https://paypal.me/kiorky>`_
 
 
 **Features**
