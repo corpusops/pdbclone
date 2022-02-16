@@ -8,7 +8,7 @@ from __future__ import print_function
 
 import sys
 
-__version__ =  '1.10.1'
+__version__ =  '1.10.2'
 DFLT_ADDRESS = ('127.0.0.1', 7935)
 
 # Python 2.6 or older
